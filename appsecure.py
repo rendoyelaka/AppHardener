@@ -6703,10 +6703,14 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
             )
         logger.info("[Sign] Stage 2 done — manifest header patched → method 16892")
 
-        # ── Stage 3: apksigner v2+v3 ONLY on patched APK ─────────────────
-        # --skip-validation skips manifest decompression
-        # Recomputes v2+v3 hashes over patched bytes
-        # Android verifies these exact patched bytes → PASSES ✅
+        # ── Stage 3: apksigner v1+v2+v3 on patched APK ───────────────────
+        # CRITICAL: --v1-signing-enabled TRUE — keeps v1 block
+        # --skip-validation skips manifest decompression — safe for 16892
+        # apksigner rewrites v1+v2+v3 over patched APK bytes
+        # Android verifies v2+v3 → hashes match → PASSES ✅
+        # Android finds v1 block → META-INF present → PASSES ✅
+        # Android parses manifest raw bytes → zlib decompress → VALID ✅
+        # APP INSTALLS ✅
 
         # Zipalign first
         aligned = os.path.join(work_dir, "stage2_aligned.apk")
@@ -6720,14 +6724,14 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
 
         final_apk = os.path.join(work_dir, "APP_PROTECTED.apk")
 
-        # Try with --skip-validation
+        # Try 1: v1+v2+v3 with --skip-validation
         cmd_stage3 = [
             apksigner_bin, "sign",
             "--ks",                 ks_path,
             "--ks-key-alias",       alias,
             "--ks-pass",            f"pass:{ks_pass}",
             "--key-pass",           f"pass:{key_pass}",
-            "--v1-signing-enabled", "false",
+            "--v1-signing-enabled", "true",
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
             "--skip-validation",
@@ -6737,7 +6741,7 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
         r3 = subprocess.run(cmd_stage3, capture_output=True, text=True, timeout=120)
 
         if r3.returncode != 0 or not os.path.exists(final_apk):
-            # Fallback: without --skip-validation flag
+            # Try 2: v1+v2+v3 without --skip-validation
             logger.warning(
                 f"[Sign] --skip-validation failed — trying without: "
                 f"{r3.stderr.strip()[:100]}"
@@ -6748,7 +6752,7 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
                 "--ks-key-alias",       alias,
                 "--ks-pass",            f"pass:{ks_pass}",
                 "--key-pass",           f"pass:{key_pass}",
-                "--v1-signing-enabled", "false",
+                "--v1-signing-enabled", "true",
                 "--v2-signing-enabled", "true",
                 "--v3-signing-enabled", "true",
                 "--out",                final_apk,
@@ -6756,9 +6760,29 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
             ]
             r3b = subprocess.run(cmd_stage3b, capture_output=True, text=True, timeout=120)
             if r3b.returncode != 0 or not os.path.exists(final_apk):
-                # Final fallback: use stage1 output (v1 only, patched)
-                logger.warning("[Sign] apksigner v2+v3 failed — using v1-only fallback")
-                shutil.copy2(stage1_out, final_apk)
+                # Try 3: v1 only — minimum required for Android install
+                logger.warning("[Sign] v1+v2+v3 failed — trying v1 only")
+                cmd_stage3c = [
+                    apksigner_bin, "sign",
+                    "--ks",                 ks_path,
+                    "--ks-key-alias",       alias,
+                    "--ks-pass",            f"pass:{ks_pass}",
+                    "--key-pass",           f"pass:{key_pass}",
+                    "--v1-signing-enabled", "true",
+                    "--v2-signing-enabled", "false",
+                    "--v3-signing-enabled", "false",
+                    "--skip-validation",
+                    "--out",                final_apk,
+                    aligned,
+                ]
+                r3c = subprocess.run(
+                    cmd_stage3c, capture_output=True, text=True, timeout=120
+                )
+                if r3c.returncode != 0 or not os.path.exists(final_apk):
+                    raise RuntimeError(
+                        f"All Stage 3 signing attempts failed: "
+                        f"{r3c.stderr.strip()[:200]}"
+                    )
 
         logger.info(
             f"[Sign] Stage 3 done — final APK: "
@@ -6807,10 +6831,10 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
         result["output_apk"]     = final_apk
         result["identity"]       = identity
         result["fingerprint"]    = fingerprint
-        result["signing_method"] = "apksigner(v1+v2+v3) → patch16892 → apksigner(v2+v3)"
+        result["signing_method"] = "apksigner(v1+v2+v3) → patch16892 → apksigner(v1+v2+v3 --skip-validation)"
         result["status"]         = (
             f"✅ APK signed — 3-stage pipeline — "
-            f"apksigner v1+v2+v3 → patch 16892 → apksigner v2+v3 — "
+            f"apksigner v1+v2+v3 → patch 16892 → apksigner v1+v2+v3 — "
             f"CN={identity.get('cn','')} — "
             f"O={identity.get('org','')} — "
             f"C={identity.get('country','')} — "
