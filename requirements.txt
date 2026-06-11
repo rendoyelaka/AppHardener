@@ -1,0 +1,12 @@
+# AppSecure — Python Dependencies
+# Android application security hardening system
+# Round 1 — ZIP Header Protection
+
+# Telegram bot framework
+python-telegram-bot==21.9
+
+# HTTP client used by python-telegram-bot
+httpx==0.27.0
+
+# Async support
+anyio==4.3.0
