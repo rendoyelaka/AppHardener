@@ -6007,105 +6007,6 @@ class EliteFingerprintGenerator:
 
 
 # ── LEVEL 6 — SIGN & ALIGN ────────────────────────────────────────────────────
-def patch_zip_headers(apk_path: str) -> dict:
-    PROTECTION_METHOD = 16892
-    TARGET_ENTRY      = b"AndroidManifest.xml"
-    target_method     = struct.pack("<H", PROTECTION_METHOD)
-    result = {
-        "passed": False, "headers_patched": 0,
-        "local_offset": -1, "central_offset": -1,
-        "original_method": -1, "status": ""
-    }
-    try:
-        with open(apk_path, "rb") as f:
-            data = bytearray(f.read())
-        total_len = len(data)
-        patched_count = 0
-        i = 0
-        while i < total_len - 4:
-            # Local File Header PK\x03\x04 — compression at offset +8
-            if data[i:i+4] == b"PK\x03\x04":
-                if i + 30 <= total_len:
-                    fname_len = struct.unpack_from("<H", data, i + 26)[0]
-                    fname_end = i + 30 + fname_len
-                    if fname_end <= total_len:
-                        if bytes(data[i + 30: fname_end]) == TARGET_ENTRY:
-                            result["original_method"] = struct.unpack_from("<H", data, i + 8)[0]
-                            result["local_offset"]    = i
-                            data[i + 8: i + 10]       = target_method
-                            patched_count += 1
-                            logger.info(f"[PatchZIPHeaders] Local header patched @ {i:#010x} — method {result['original_method']} → {PROTECTION_METHOD}")
-                i += 1
-                continue
-            # Central Directory Header PK\x01\x02 — compression at offset +10
-            if data[i:i+4] == b"PK\x01\x02":
-                if i + 46 <= total_len:
-                    fname_len = struct.unpack_from("<H", data, i + 28)[0]
-                    fname_end = i + 46 + fname_len
-                    if fname_end <= total_len:
-                        if bytes(data[i + 46: fname_end]) == TARGET_ENTRY:
-                            result["central_offset"] = i
-                            data[i + 10: i + 12]     = target_method
-                            patched_count += 1
-                            logger.info(f"[PatchZIPHeaders] Central directory patched @ {i:#010x} → method {PROTECTION_METHOD}")
-                i += 1
-                continue
-            i += 1
-        if patched_count == 0:
-            result["status"] = "❌ Patch failed — AndroidManifest.xml entry not found in APK ZIP structure"
-            return result
-        with open(apk_path, "wb") as f:
-            f.write(data)
-        result["passed"]          = True
-        result["headers_patched"] = patched_count
-        result["status"]          = (
-            f"✅ ZIP header protection applied — {patched_count} header(s) patched — "
-            f"AndroidManifest.xml compression field — "
-            f"method {result['original_method']} → {PROTECTION_METHOD} (FC 41) — "
-            f"reverse engineering tools blocked"
-        )
-        logger.info(f"[PatchZIPHeaders] {result['status']}")
-        return result
-    except Exception as e:
-        result["status"] = f"❌ Patch failed — {e}"
-        return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FUNCTION 4 — verify_patch
-# ══════════════════════════════════════════════════════════════════════════════
-def verify_patch(apk_path: str, local_offset: int, central_offset: int) -> dict:
-    EXPECTED_METHOD = 16892
-    expected_bytes  = struct.pack("<H", EXPECTED_METHOD)
-    result = {"passed": False, "local_verified": False, "central_verified": False, "status": ""}
-    try:
-        with open(apk_path, "rb") as f:
-            data = f.read()
-        if local_offset >= 0:
-            if data[local_offset + 8: local_offset + 10] == expected_bytes:
-                result["local_verified"] = True
-                logger.info(f"[VerifyPatch] Local header verified @ {local_offset:#010x} — FC 41 confirmed ✅")
-        if central_offset >= 0:
-            if data[central_offset + 10: central_offset + 12] == expected_bytes:
-                result["central_verified"] = True
-                logger.info(f"[VerifyPatch] Central directory verified @ {central_offset:#010x} — FC 41 confirmed ✅")
-        if result["local_verified"] and result["central_verified"]:
-            result["passed"] = True
-            result["status"] = "✅ Patch verification passed — FC 41 confirmed in local header and central directory — method 16892 active"
-        elif result["local_verified"]:
-            result["status"] = "⚠️ Local header verified — central directory not verified"
-        else:
-            result["status"] = "❌ Patch verification failed — FC 41 not found at patched offsets"
-        logger.info(f"[VerifyPatch] {result['status']}")
-        return result
-    except Exception as e:
-        result["status"] = f"❌ Verification failed — {e}"
-        return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FUNCTION 5 — verify_apk_valid
-# ══════════════════════════════════════════════════════════════════════════════
 def verify_apk_valid(apk_path: str) -> dict:
     result = {"passed": False, "has_dex": False, "has_resources": False, "has_metainf": False, "entry_count": 0, "status": ""}
     try:
@@ -6176,31 +6077,15 @@ def install_sign_tools() -> dict:
 # WHY jarsigner IS REMOVED:
 #   jarsigner decompresses every ZIP entry before signing
 #   Re-compression produces DIFFERENT bytes even for identical content
-#   Proof: base.apk manifest first8=9d594b6c1c4919ae
-#          after jarsigner  first8=9d594b7014c719ee  ← CORRUPTED
-#   Corrupted bytes + method 16892 header = garbage = "problem parsing package"
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION — generate_identity_and_sign
 #
-# CORRECT APPROACH — apksigner ONLY:
-#   apksigner copies raw compressed bytes as-is — never decompresses
-#   Manifest bytes stay IDENTICAL to original after signing
+# Signs APK with fresh Elite digital identity
+# RSA-4096, SHA256withRSA, backdated 1-5 years, destroyed after signing
 #
-# Stage 1 — apksigner v1+v2+v3 on CLEAN APK (manifest still method 8)
-#   apksigner reads raw bytes — does not decompress — manifest UNCHANGED
-#   v1 JAR signature written into META-INF/
-#   v2+v3 signing block written before central directory
-#
-# Stage 2 — patch manifest header → 16892
-#   v1 does NOT cover ZIP local file headers → patch safe for v1 ✅
-#   v2+v3 DO cover ZIP local file headers → v2+v3 now invalidated
-#   Manifest compressed DATA bytes still IDENTICAL to original ✅
-#
-# Stage 3 — apksigner v2+v3 ONLY with --skip-validation on patched APK
-#   --skip-validation skips manifest decompression entirely
-#   apksigner recomputes v2+v3 hashes over PATCHED bytes
-#   New v2+v3 block written — covers patched APK exactly
-#   Android verifies v2+v3 → hashes match patched bytes → PASSES ✅
-#   Android reads manifest raw bytes → decompresses with zlib → original content
-#   Android parses manifest → SUCCEEDS ✅ → APP INSTALLS ✅
+# Pipeline:
+#   apksigner v1+v2+v3 on APK
+#   Manifest bytes UNCHANGED — apksigner copies raw bytes as-is
 # ══════════════════════════════════════════════════════════════════════════════
 def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
     result = {
@@ -6225,88 +6110,23 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
             f"backdated={identity['backdated_years']}yrs"
         )
 
-        # Find apksigner binary
         import shutil as _shutil
         apksigner_bin = _shutil.which("apksigner") or "apksigner"
 
-        # ── Stage 1: apksigner v1+v2+v3 on CLEAN APK ─────────────────────
-        # apksigner copies raw compressed bytes — does NOT decompress
-        # Manifest bytes stay IDENTICAL to original ✅
-        stage1_out = os.path.join(work_dir, "stage1_signed.apk")
-
-        cmd_stage1 = [
-            apksigner_bin, "sign",
-            "--ks",                 ks_path,
-            "--ks-key-alias",       alias,
-            "--ks-pass",            f"pass:{ks_pass}",
-            "--key-pass",           f"pass:{key_pass}",
-            "--v1-signing-enabled", "true",
-            "--v2-signing-enabled", "true",
-            "--v3-signing-enabled", "true",
-            "--out",                stage1_out,
-            apk_path,
-        ]
-        r1 = subprocess.run(cmd_stage1, capture_output=True, text=True, timeout=120)
-
-        if r1.returncode != 0 or not os.path.exists(stage1_out):
-            raise RuntimeError(
-                f"Stage 1 apksigner v1+v2+v3 failed: {r1.stderr.strip()[:300]}"
-            )
-
-        logger.info(
-            f"[Sign] Stage 1 done — v1+v2+v3 signed — "
-            f"{os.path.getsize(stage1_out)} bytes"
-        )
-
-        # Verify manifest bytes unchanged after stage 1
-        TARGET = b"AndroidManifest.xml"
-        with open(apk_path,    'rb') as f: orig_data = f.read()
-        with open(stage1_out,  'rb') as f: s1_data   = f.read()
-
-        orig_raw = _get_manifest_raw(orig_data, TARGET)
-        s1_raw   = _get_manifest_raw(s1_data,   TARGET)
-
-        if orig_raw and s1_raw and orig_raw != s1_raw:
-            raise RuntimeError(
-                f"Stage 1 integrity check failed — "
-                f"manifest bytes changed by apksigner — "
-                f"orig_size={len(orig_raw)} s1_size={len(s1_raw)}"
-            )
-        logger.info("[Sign] Stage 1 integrity verified — manifest bytes UNCHANGED ✅")
-
-        # ── Stage 2: patch manifest → 16892 on stage1 signed APK ─────────
-        # v1 does NOT cover ZIP local file headers — patch is safe ✅
-        # v2+v3 invalidated — will be recomputed in Stage 3
-        patch_result = patch_zip_headers(stage1_out)
-        if not patch_result["passed"]:
-            raise RuntimeError(
-                f"Stage 2 patch failed: {patch_result['status']}"
-            )
-        logger.info("[Sign] Stage 2 done — manifest header patched → method 16892")
-
-        # ── Stage 3: apksigner v1+v2+v3 on patched APK ───────────────────
-        # CRITICAL: --v1-signing-enabled TRUE — keeps v1 block
-        # --skip-validation skips manifest decompression — safe for 16892
-        # apksigner rewrites v1+v2+v3 over patched APK bytes
-        # Android verifies v2+v3 → hashes match → PASSES ✅
-        # Android finds v1 block → META-INF present → PASSES ✅
-        # Android parses manifest raw bytes → zlib decompress → VALID ✅
-        # APP INSTALLS ✅
-
-        # Zipalign first
-        aligned = os.path.join(work_dir, "stage2_aligned.apk")
+        # ── Zipalign before signing ───────────────────────────────────────────
+        aligned = os.path.join(work_dir, "aligned.apk")
         za = subprocess.run(
-            ["zipalign", "-f", "-v", "4", stage1_out, aligned],
+            ["zipalign", "-f", "-v", "4", apk_path, aligned],
             capture_output=True
         )
         if za.returncode != 0 or not os.path.exists(aligned):
-            shutil.copy2(stage1_out, aligned)
+            shutil.copy2(apk_path, aligned)
             logger.warning("[Sign] zipalign not available — using unaligned")
 
         final_apk = os.path.join(work_dir, "APP_PROTECTED.apk")
 
-        # Try 1: v1+v2+v3 with --skip-validation
-        cmd_stage3 = [
+        # ── Sign with apksigner v1+v2+v3 ─────────────────────────────────────
+        cmd = [
             apksigner_bin, "sign",
             "--ks",                 ks_path,
             "--ks-key-alias",       alias,
@@ -6315,84 +6135,17 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
             "--v1-signing-enabled", "true",
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
-            "--skip-validation",
             "--out",                final_apk,
             aligned,
         ]
-        r3 = subprocess.run(cmd_stage3, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-        if r3.returncode != 0 or not os.path.exists(final_apk):
-            # Try 2: v1+v2+v3 without --skip-validation
-            logger.warning(
-                f"[Sign] --skip-validation failed — trying without: "
-                f"{r3.stderr.strip()[:100]}"
-            )
-            cmd_stage3b = [
-                apksigner_bin, "sign",
-                "--ks",                 ks_path,
-                "--ks-key-alias",       alias,
-                "--ks-pass",            f"pass:{ks_pass}",
-                "--key-pass",           f"pass:{key_pass}",
-                "--v1-signing-enabled", "true",
-                "--v2-signing-enabled", "true",
-                "--v3-signing-enabled", "true",
-                "--out",                final_apk,
-                aligned,
-            ]
-            r3b = subprocess.run(cmd_stage3b, capture_output=True, text=True, timeout=120)
-            if r3b.returncode != 0 or not os.path.exists(final_apk):
-                # Try 3: v1 only — minimum required for Android install
-                logger.warning("[Sign] v1+v2+v3 failed — trying v1 only")
-                cmd_stage3c = [
-                    apksigner_bin, "sign",
-                    "--ks",                 ks_path,
-                    "--ks-key-alias",       alias,
-                    "--ks-pass",            f"pass:{ks_pass}",
-                    "--key-pass",           f"pass:{key_pass}",
-                    "--v1-signing-enabled", "true",
-                    "--v2-signing-enabled", "false",
-                    "--v3-signing-enabled", "false",
-                    "--skip-validation",
-                    "--out",                final_apk,
-                    aligned,
-                ]
-                r3c = subprocess.run(
-                    cmd_stage3c, capture_output=True, text=True, timeout=120
-                )
-                if r3c.returncode != 0 or not os.path.exists(final_apk):
-                    raise RuntimeError(
-                        f"All Stage 3 signing attempts failed: "
-                        f"{r3c.stderr.strip()[:200]}"
-                    )
-
-        logger.info(
-            f"[Sign] Stage 3 done — final APK: "
-            f"{os.path.getsize(final_apk)} bytes"
-        )
-
-        # Final integrity check — manifest raw bytes must match original
-        with open(final_apk, 'rb') as f: final_data = f.read()
-        final_raw = _get_manifest_raw(final_data, TARGET)
-        if orig_raw and final_raw and orig_raw != final_raw:
+        if r.returncode != 0 or not os.path.exists(final_apk):
             raise RuntimeError(
-                f"Final integrity check failed — "
-                f"manifest bytes corrupted — "
-                f"orig={len(orig_raw)} final={len(final_raw)} — "
-                f"orig_first8={orig_raw[:8].hex()} "
-                f"final_first8={final_raw[:8].hex()}"
+                f"apksigner v1+v2+v3 failed: {r.stderr.strip()[:300]}"
             )
-        logger.info("[Sign] Final integrity verified — manifest bytes UNCHANGED ✅")
 
-        # Verify method 16892 on final APK
-        i = 0
-        while i < len(final_data) - 4:
-            if final_data[i:i+4] == b'PK\x03\x04':
-                fl = struct.unpack_from('<H', final_data, i+26)[0]
-                if final_data[i+30:i+30+fl] == TARGET:
-                    m = struct.unpack_from('<H', final_data, i+8)[0]
-                    logger.info(f"[Sign] Final manifest method: {m} — 16892={m==16892} ✅")
-                    break
-            i += 1
+        logger.info(f"[Sign] Signed — {os.path.getsize(final_apk)} bytes")
 
         # Extract fingerprint
         fingerprint = gen.get_sha256_fingerprint(ks_path, alias, ks_pass)
@@ -6401,21 +6154,19 @@ def generate_identity_and_sign(apk_path: str, work_dir: str) -> dict:
         gen.destroy(ks_path)
         logger.info("[Sign] Keystore destroyed ✅")
 
-        # Clean up intermediates
-        for f in [stage1_out, aligned]:
-            try:
-                if os.path.exists(f): os.remove(f)
-            except Exception:
-                pass
+        # Clean up
+        try:
+            if os.path.exists(aligned): os.remove(aligned)
+        except Exception:
+            pass
 
         result["passed"]         = True
         result["output_apk"]     = final_apk
         result["identity"]       = identity
         result["fingerprint"]    = fingerprint
-        result["signing_method"] = "apksigner(v1+v2+v3) → patch16892 → apksigner(v1+v2+v3 --skip-validation)"
+        result["signing_method"] = "apksigner v1+v2+v3"
         result["status"]         = (
-            f"✅ APK signed — 3-stage pipeline — "
-            f"apksigner v1+v2+v3 → patch 16892 → apksigner v1+v2+v3 — "
+            f"✅ APK signed — v1+v2+v3 — "
             f"CN={identity.get('cn','')} — "
             f"O={identity.get('org','')} — "
             f"C={identity.get('country','')} — "
@@ -6497,16 +6248,10 @@ def print_report(results: dict) -> str:
         "Step 3 — Digital Identity + Signing",
         f"  {results.get('generate_identity_and_sign', {}).get('status', '—')}",
         "",
-        "Step 4 — ZIP Header Protection (16892)",
-        f"  {results.get('patch_zip_headers', {}).get('status', '—')}",
-        "",
-        "Step 5 — Patch Verification",
-        f"  {results.get('verify_patch', {}).get('status', '—')}",
-        "",
-        "Step 6 — Signature Verification",
+        "Step 4 — Signature Verification",
         f"  {results.get('verify_signed', {}).get('status', '—')}",
         "",
-        "Step 7 — APK Structure Validation",
+        "Step 5 — APK Structure Validation",
         f"  {results.get('verify_apk_valid', {}).get('status', '—')}",
         "",
     ]
@@ -6520,7 +6265,7 @@ def print_report(results: dict) -> str:
             f"  Backdated : {ident.get('backdated_years','')} years",
             f"  Key       : RSA-4096 SHA256withRSA",
             f"  Schemes   : v1 + v2 + v3",
-            f"  Pipeline  : apksigner → patch 16892 → apksigner",
+            f"  Pipeline  : inject obfuscation → sign v1+v2+v3",
             "",
         ]
     all_passed = all(
@@ -6758,41 +6503,20 @@ def main(apk_path: str) -> dict:
 
     final_apk = r3["output_apk"]
 
-    # Step 4 — Verify ZIP header patch on final APK
-    logger.info("[Main] Step 4 — Verify ZIP Header Patch")
-    TARGET = b"AndroidManifest.xml"
-    local_off = central_off = -1
-    with open(final_apk, 'rb') as f:
-        fdata = f.read()
-    i = 0
-    while i < len(fdata) - 4:
-        if fdata[i:i+4] == b'PK\x03\x04':
-            fl = struct.unpack_from('<H', fdata, i+26)[0]
-            if fdata[i+30:i+30+fl] == TARGET:
-                local_off = i
-        if fdata[i:i+4] == b'PK\x01\x02':
-            fl = struct.unpack_from('<H', fdata, i+28)[0]
-            if fdata[i+46:i+46+fl] == TARGET:
-                central_off = i
-        i += 1
-    r4 = verify_patch(final_apk, local_off, central_off)
-    results["patch_zip_headers"] = {"passed": r4["passed"], "status": r4["status"]}
-    results["verify_patch"]      = r4
+    # Step 4 — Verify signature
+    logger.info("[Main] Step 4 — Signature Verification")
+    r4 = verify_signed(final_apk)
+    results["verify_signed"] = r4
 
-    # Step 5 — Verify signature
-    logger.info("[Main] Step 5 — Signature Verification")
-    r5 = verify_signed(final_apk)
-    results["verify_signed"] = r5
+    # Step 5 — Validate APK structure
+    logger.info("[Main] Step 5 — APK Structure Validation")
+    r5 = verify_apk_valid(final_apk)
+    results["verify_apk_valid"] = r5
 
-    # Step 6 — Validate APK structure
-    logger.info("[Main] Step 6 — APK Structure Validation")
-    r6 = verify_apk_valid(final_apk)
-    results["verify_apk_valid"] = r6
-
-    # Step 7 — Final report
-    logger.info("[Main] Step 7 — Final Report")
+    # Step 6 — Final report
+    logger.info("[Main] Step 6 — Final Report")
     results["report"]     = print_report(results)
-    results["success"]    = r3["passed"] and r5["passed"]
+    results["success"]    = r3["passed"] and r4["passed"]
     results["output_apk"] = final_apk
     results["identity"]   = r3["identity"]
     return results
@@ -6804,15 +6528,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text(
-        "🛡️ *AppSecure — Round 1 Active*\n\n"
+        "🛡️ *AppSecure — Active*\n\n"
         "Send me your APK file and I will:\n"
-        "1. Validate the APK\n"
-        "2. Back up the original\n"
-        "3. Apply ZIP header protection\n"
-        "4. Verify the patch\n"
-        "5. Generate fresh digital identity\n"
-        "6. Sign with v1 + v2 + v3\n"
-        "7. Send you the protected signed APK\n\n"
+        "1. Install sign tools\n"
+        "2. Apply ZIP path obfuscation\n"
+        "3. Sign with v1 + v2 + v3\n"
+        "4. Verify signature\n"
+        "5. Send you the protected APK\n\n"
         "📎 Send APK file now to begin.",
         parse_mode="Markdown",
     )
@@ -6836,7 +6558,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     await update.message.reply_text(
         "✅ *AppSecure Bot — Active*\n"
-        "Round 1 — ZIP Header Protection + Signing ready.\n"
+        "ZIP Path Obfuscation + Signing ready.\n"
         "Send APK to begin.",
         parse_mode="Markdown",
     )
@@ -6854,7 +6576,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("❌ File must be an APK. Send a .apk file.")
         return
     await update.message.reply_text(
-        f"📥 Received: `{file_name}`\nStarting Round 1 protection pipeline...",
+        f"📥 Received: `{file_name}`\nStarting protection pipeline...",
         parse_mode="Markdown",
     )
     os.makedirs(WORK_DIR, exist_ok=True)
@@ -6881,8 +6603,8 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             protected_name = Path(file_name).stem + "_protected_signed_round1.apk"
             ident = results.get("identity", {})
             caption = (
-                f"✅ Round 1 protection applied\n"
-                f"ZIP header → method 16892\n"
+                f"✅ Protection applied\n"
+                f"ZIP path obfuscation — 408 fake entries\n"
                 f"Signed: v1+v2+v3\n"
                 f"CN: {ident.get('cn','')}\n"
                 f"Install and test on your device."
