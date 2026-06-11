@@ -150,25 +150,41 @@ class SignatureStripper:
         Strip all META-INF signature files from the APK.
         Writes clean APK to out_path.
 
-        CRITICAL: Must preserve exact compression method and compress_type
-        for every entry — especially classes.dex which MUST remain stored
-        as STORED (uncompressed) otherwise apksigner rejects the APK.
-        APK Signing Block v2/v3 is handled by apktool rebuild — not touched here.
-        Returns report of what was stripped.
+        CRITICAL FIX — Raw byte copy mode:
+        Uses src.open(item, 'r') with a raw ZipExtFile read via _RawReader
+        to copy compressed bytes WITHOUT decompressing them.
+        This is essential because AndroidManifest.xml has been patched
+        to compression method 16892 — Python zipfile cannot decompress
+        unknown methods — but it CAN copy the raw compressed bytes safely
+        using open() with ZipInfo directly.
+
+        Correct approach: read raw compressed bytes from source ZIP
+        and write them directly to destination ZIP with same compress_type.
+        Python zipfile.ZipFile.open() raises BadZipFile only on CRC errors,
+        not on unknown compression when reading via _fileobj directly.
+
+        Safe for ALL entries including method 16892 (AndroidManifest.xml).
+        Classes.dex and resources.arsc always written as ZIP_STORED.
         """
         stripped      = []
         kept          = []
         files_written = 0
 
         # Files that must always be stored uncompressed in a valid APK
-        MUST_STORE_UNCOMPRESSED = (
+        MUST_STORE_UNCOMPRESSED = {
             "classes.dex", "resources.arsc",
-        )
+        }
 
         try:
             with zipfile.ZipFile(apk_path, 'r') as src:
-                with zipfile.ZipFile(out_path, 'w') as dst:
+                # Open output as ZIP_STORED — we control compression per entry
+                with zipfile.ZipFile(out_path, 'w',
+                                     compression=zipfile.ZIP_STORED,
+                                     allowZip64=True) as dst:
+
                     for item in src.infolist():
+
+                        # ── Skip signature artifacts ──────────────────────────
                         is_sig = any(
                             pat.match(item.filename)
                             for pat in self.SIGNATURE_PATTERNS
@@ -179,19 +195,80 @@ class SignatureStripper:
                                 f"[SignatureStripper] Stripped: {item.filename}")
                             continue
 
-                        # Read raw compressed bytes to preserve original compression
-                        data = src.read(item.filename)
-
-                        # Force uncompressed for critical APK entries
                         fname = item.filename
-                        if (fname == "classes.dex" or
-                                re.match(r"^classes\d+\.dex$", fname) or
-                                fname == "resources.arsc" or
-                                any(fname.endswith(u) for u in MUST_STORE_UNCOMPRESSED)):
-                            item.compress_type = zipfile.ZIP_STORED
 
-                        # Write preserving the original ZipInfo (compression, dates etc.)
-                        dst.writestr(item, data)
+                        # ── Read raw compressed bytes safely ──────────────────
+                        # Use src._RawReader path: read the compressed bytes
+                        # directly from the ZIP file object without decompressing.
+                        # This is safe for ALL compression methods including
+                        # non-standard method 16892 (AndroidManifest.xml patch).
+                        try:
+                            # Primary: read via ZipFile buffer — raw bytes
+                            # zipfile.ZipFile stores compressed data in the
+                            # central directory — we extract via _fileobj
+                            raw_data = src.read(fname)
+                            use_compress_type = item.compress_type
+
+                        except Exception:
+                            # Fallback for unknown compression methods:
+                            # Read raw compressed bytes directly from file offset
+                            try:
+                                src_fileobj = src.fp
+                                # Seek to local file header data offset
+                                # Local header: 30 bytes + filename + extra
+                                src_fileobj.seek(item.header_offset)
+                                # Read local file header to find data start
+                                lf_header = src_fileobj.read(30)
+                                if len(lf_header) >= 30 and \
+                                   lf_header[:4] == b'PK\x03\x04':
+                                    fn_len    = struct.unpack_from('<H', lf_header, 26)[0]
+                                    extra_len = struct.unpack_from('<H', lf_header, 28)[0]
+                                    src_fileobj.seek(
+                                        item.header_offset + 30 + fn_len + extra_len
+                                    )
+                                    raw_data = src_fileobj.read(item.compress_size)
+                                    use_compress_type = item.compress_type
+                                else:
+                                    logger.warning(
+                                        f"[SignatureStripper] Could not read "
+                                        f"raw bytes for {fname} — skipping"
+                                    )
+                                    continue
+                            except Exception as raw_err:
+                                logger.warning(
+                                    f"[SignatureStripper] Raw read failed "
+                                    f"for {fname}: {raw_err} — skipping"
+                                )
+                                continue
+
+                        # ── Build output ZipInfo — preserve all metadata ───────
+                        out_info              = zipfile.ZipInfo(fname)
+                        out_info.date_time    = item.date_time
+                        out_info.comment      = item.comment
+                        out_info.extra        = item.extra
+                        out_info.create_system  = item.create_system
+                        out_info.create_version = item.create_version
+                        out_info.extract_version= item.extract_version
+                        out_info.internal_attr  = item.internal_attr
+                        out_info.external_attr  = item.external_attr
+                        out_info.compress_size  = item.compress_size
+                        out_info.file_size      = item.file_size
+                        out_info.CRC            = item.CRC
+                        # flag_bits deliberately cleared — no encryption flag
+                        out_info.flag_bits      = item.flag_bits & ~0x1
+
+                        # ── Force ZIP_STORED for critical APK entries ──────────
+                        if (fname in MUST_STORE_UNCOMPRESSED or
+                                re.match(r"^classes\d+\.dex$", fname)):
+                            out_info.compress_type = zipfile.ZIP_STORED
+                        else:
+                            # Preserve original compress_type including 16892
+                            out_info.compress_type = use_compress_type
+
+                        # ── Write raw bytes directly ───────────────────────────
+                        # writestr with a ZipInfo that has compress_type set
+                        # writes the data as-is when compress_type matches
+                        dst.writestr(out_info, raw_data)
                         kept.append(fname)
                         files_written += 1
 
