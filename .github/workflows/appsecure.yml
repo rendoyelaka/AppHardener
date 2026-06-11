@@ -1,0 +1,53 @@
+name: AppSecure — Round 1 Protection Bot
+
+on:
+  workflow_dispatch:   # Manual trigger from GitHub Actions tab
+  push:
+    branches:
+      - main           # Auto-start on every push to main
+
+jobs:
+  run-appsecure-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ── Step 1: Checkout repository ────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Set up Python ───────────────────────────────────────────────
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Step 3: Install Python dependencies ────────────────────────────────
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Step 4: Verify environment ──────────────────────────────────────────
+      - name: Verify Environment
+        run: |
+          python --version
+          python -c "import telegram; print('python-telegram-bot ready')"
+
+      # ── Step 5: Run AppSecure bot ───────────────────────────────────────────
+      - name: Run AppSecure Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID:  ${{ secrets.ADMIN_ID }}
+        run: |
+          python appsecure.py
+
+      # ── Step 6: Upload log on failure ───────────────────────────────────────
+      - name: Upload Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appsecure-log
+          path: appsecure_log.txt
+          retention-days: 3
