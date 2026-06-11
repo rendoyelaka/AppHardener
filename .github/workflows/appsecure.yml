@@ -1,41 +1,90 @@
 name: AppSecure — Round 1 Protection Bot
 
 on:
-  workflow_dispatch:   # Manual trigger from GitHub Actions tab
+  workflow_dispatch:
   push:
     branches:
-      - main           # Auto-start on every push to main
+      - main
 
 jobs:
-  run-appsecure-bot:
+  notify-and-run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
 
-      # ── Step 1: Checkout repository ────────────────────────────────────────
+      # ── Step 1: Checkout ───────────────────────────────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── Step 2: Set up Python ───────────────────────────────────────────────
+      # ── Step 2: Telegram push notification ────────────────────────────────
+      - name: Notify Telegram — New Update Received
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_SHA=$(git log -1 --pretty=%h)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="🔔 *AppHardener — New Update*%0A%0A📦 Repo: \`${{ github.repository }}\`%0A🌿 Branch: \`${{ github.ref_name }}\`%0A👤 Author: \`${COMMIT_AUTHOR}\`%0A📝 Change: \`${COMMIT_MSG}\`%0A🔖 Commit: \`${COMMIT_SHA}\`%0A%0A⚙️ Build started — [View Run](${RUN_URL})"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.ADMIN_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true"
+
+      # ── Step 3: Set up Python ──────────────────────────────────────────────
       - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── Step 3: Install Python dependencies ────────────────────────────────
-      - name: Install Dependencies
+      # ── Step 4: Cache pip dependencies ────────────────────────────────────
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        id: pip-cache
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── Step 5: Cache apt packages ─────────────────────────────────────────
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        id: apt-cache
+        with:
+          path: |
+            /var/cache/apt/archives
+            /usr/lib/jvm
+            /usr/bin/zipalign
+            /usr/bin/apksigner
+            /usr/bin/keytool
+          key: ${{ runner.os }}-apt-jdk-zipalign-apksigner-v2
+          restore-keys: |
+            ${{ runner.os }}-apt-jdk-zipalign-apksigner-
+
+      # ── Step 6: Install system dependencies (uses cache if available) ──────
+      - name: Install System Dependencies
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq default-jdk zipalign apksigner
+
+      # ── Step 7: Install Python dependencies (uses cache if available) ──────
+      - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── Step 4: Verify environment ──────────────────────────────────────────
+      # ── Step 8: Verify environment ─────────────────────────────────────────
       - name: Verify Environment
         run: |
           python --version
           python -c "import telegram; print('python-telegram-bot ready')"
+          keytool -help 2>&1 | head -1 || echo "keytool check done"
+          zipalign 2>&1 | head -1 || echo "zipalign check done"
+          apksigner version 2>&1 | head -1 || echo "apksigner check done"
 
-      # ── Step 5: Run AppSecure bot ───────────────────────────────────────────
+      # ── Step 9: Run AppSecure bot ──────────────────────────────────────────
       - name: Run AppSecure Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -43,7 +92,29 @@ jobs:
         run: |
           python appsecure.py
 
-      # ── Step 6: Upload log on failure ───────────────────────────────────────
+      # ── Step 10: Telegram notification — build complete ────────────────────
+      - name: Notify Telegram — Bot Ready
+        if: success()
+        run: |
+          MESSAGE="✅ *AppHardener Bot — Ready*%0A%0ABot is running and waiting for your APK.%0ASend your APK to the bot now."
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.ADMIN_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"
+
+      # ── Step 11: Telegram notification — build failed ─────────────────────
+      - name: Notify Telegram — Build Failed
+        if: failure()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="❌ *AppHardener — Build Failed*%0A%0ACheck the run for details:%0A[View Run](${RUN_URL})"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.ADMIN_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true"
+
+      # ── Step 12: Upload log on failure ────────────────────────────────────
       - name: Upload Log on Failure
         if: failure()
         uses: actions/upload-artifact@v4
