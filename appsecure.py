@@ -85,192 +85,225 @@ except Exception:
 
 class SignatureStripper:
     """
-    Detects and strips all existing signature artifacts from an APK
-    before processing begins.
-
-    Strips:
-      - META-INF/*.SF   — JAR signature manifest
-      - META-INF/*.RSA  — RSA certificate block
-      - META-INF/*.DSA  — DSA certificate block
-      - META-INF/*.EC   — EC certificate block
-      - META-INF/MANIFEST.MF — JAR manifest (regenerated on rebuild)
-
-    The APK Signing Block v2/v3 is embedded before the ZIP central
-    directory — it is automatically discarded when apktool rebuilds
-    the APK from the workspace. No manual stripping needed for v2/v3.
-
-    Returns a report of what was found and removed.
+    Pure binary ZIP rebuilder — zero decompression used anywhere.
+    Reads raw ZIP bytes directly using struct only.
+    Safe for ALL compression methods including non-standard 16892.
+    Strips: META-INF/*.SF *.RSA *.DSA *.EC MANIFEST.MF
     """
 
-    # File patterns inside META-INF that must be removed
     SIGNATURE_PATTERNS = (
-        re.compile(r'^META-INF/.*\.SF$',   re.IGNORECASE),
-        re.compile(r'^META-INF/.*\.RSA$',  re.IGNORECASE),
-        re.compile(r'^META-INF/.*\.DSA$',  re.IGNORECASE),
-        re.compile(r'^META-INF/.*\.EC$',   re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.SF$',       re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.RSA$',      re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.DSA$',      re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.EC$',       re.IGNORECASE),
         re.compile(r'^META-INF/MANIFEST\.MF$', re.IGNORECASE),
     )
 
-    def detect(self, apk_path: str) -> dict:
-        """
-        Scan APK for existing signature artifacts.
-        Returns a report dict with found items and signing block status.
-        """
+    def _is_sig_file(self, filename):
+        for pat in self.SIGNATURE_PATTERNS:
+            if pat.match(filename):
+                return True
+        return False
+
+    def _parse_cd(self, data):
+        """Parse ZIP central directory. Returns list of entry dicts."""
+        entries = []
+        eocd_off = data.rfind(b'PK\x05\x06')
+        if eocd_off < 0:
+            raise RuntimeError("EOCD not found")
+        total_entries = struct.unpack_from('<H', data, eocd_off + 10)[0]
+        cd_offset     = struct.unpack_from('<I', data, eocd_off + 16)[0]
+        pos = cd_offset
+        for _ in range(total_entries):
+            if pos + 46 > len(data) or data[pos:pos+4] != b'PK\x01\x02':
+                break
+            fn_len      = struct.unpack_from('<H', data, pos + 28)[0]
+            extra_len   = struct.unpack_from('<H', data, pos + 30)[0]
+            comment_len = struct.unpack_from('<H', data, pos + 32)[0]
+            fname_bytes = data[pos+46 : pos+46+fn_len]
+            try:
+                fname = fname_bytes.decode('utf-8')
+            except Exception:
+                fname = fname_bytes.decode('latin-1')
+            entries.append({
+                'filename':        fname,
+                'fname_bytes':     fname_bytes,
+                'version_made':    struct.unpack_from('<H', data, pos +  4)[0],
+                'version_needed':  struct.unpack_from('<H', data, pos +  6)[0],
+                'flags':           struct.unpack_from('<H', data, pos +  8)[0],
+                'compress_method': struct.unpack_from('<H', data, pos + 10)[0],
+                'mod_time':        struct.unpack_from('<H', data, pos + 12)[0],
+                'mod_date':        struct.unpack_from('<H', data, pos + 14)[0],
+                'crc32':           struct.unpack_from('<I', data, pos + 16)[0],
+                'compress_size':   struct.unpack_from('<I', data, pos + 20)[0],
+                'uncompress_size': struct.unpack_from('<I', data, pos + 24)[0],
+                'disk_start':      struct.unpack_from('<H', data, pos + 34)[0],
+                'int_attr':        struct.unpack_from('<H', data, pos + 36)[0],
+                'ext_attr':        struct.unpack_from('<I', data, pos + 38)[0],
+                'local_hdr_offset':struct.unpack_from('<I', data, pos + 42)[0],
+                'extra_bytes':     data[pos+46+fn_len : pos+46+fn_len+extra_len],
+                'comment_bytes':   data[pos+46+fn_len+extra_len : pos+46+fn_len+extra_len+comment_len],
+                'cd_entry_size':   46 + fn_len + extra_len + comment_len,
+            })
+            pos += 46 + fn_len + extra_len + comment_len
+        return entries
+
+    def _read_raw_data(self, data, entry):
+        """Read raw compressed bytes — never decompresses — safe for method 16892."""
+        off = entry['local_hdr_offset']
+        if data[off:off+4] != b'PK\x03\x04':
+            raise RuntimeError(f"Bad local header for {entry['filename']}")
+        fn_len    = struct.unpack_from('<H', data, off + 26)[0]
+        extra_len = struct.unpack_from('<H', data, off + 28)[0]
+        data_start = off + 30 + fn_len + extra_len
+        return data[data_start : data_start + entry['compress_size']]
+
+    def detect(self, apk_path):
+        """Detect signature artifacts using pure binary scan — never decompresses."""
         found_files = []
         has_signing_block = False
-
-        # Check ZIP entries for META-INF signature files
-        try:
-            with zipfile.ZipFile(apk_path, 'r') as z:
-                for name in z.namelist():
-                    for pat in self.SIGNATURE_PATTERNS:
-                        if pat.match(name):
-                            found_files.append(name)
-                            break
-        except Exception as e:
-            logger.warning(f"[SignatureStripper] ZIP scan failed: {e}")
-
-        # Check for APK Signing Block v2/v3 magic bytes
         try:
             with open(apk_path, 'rb') as f:
                 data = f.read()
-            if b"APK Sig Block 42" in data:
+            if b'APK Sig Block 42' in data:
                 has_signing_block = True
+            for entry in self._parse_cd(data):
+                if self._is_sig_file(entry['filename']):
+                    found_files.append(entry['filename'])
         except Exception as e:
-            logger.warning(f"[SignatureStripper] Signing block check failed: {e}")
-
+            logger.warning(f"[SignatureStripper] Detect failed: {e}")
         return {
             "meta_inf_files":    found_files,
             "has_signing_block": has_signing_block,
             "total_found":       len(found_files) + (1 if has_signing_block else 0),
         }
 
-    def strip(self, apk_path: str, out_path: str) -> dict:
+    def strip(self, apk_path, out_path):
         """
-        Strip all META-INF signature files from the APK.
-        Writes clean APK to out_path.
-
-        CRITICAL FIX — Raw byte copy mode:
-        Uses src.open(item, 'r') with a raw ZipExtFile read via _RawReader
-        to copy compressed bytes WITHOUT decompressing them.
-        This is essential because AndroidManifest.xml has been patched
-        to compression method 16892 — Python zipfile cannot decompress
-        unknown methods — but it CAN copy the raw compressed bytes safely
-        using open() with ZipInfo directly.
-
-        Correct approach: read raw compressed bytes from source ZIP
-        and write them directly to destination ZIP with same compress_type.
-        Python zipfile.ZipFile.open() raises BadZipFile only on CRC errors,
-        not on unknown compression when reading via _fileobj directly.
-
-        Safe for ALL entries including method 16892 (AndroidManifest.xml).
-        Classes.dex and resources.arsc always written as ZIP_STORED.
+        Pure binary ZIP rebuild — strips signature files only.
+        Never calls zipfile.ZipFile — never decompresses anything.
+        Safe for method 16892 — raw bytes copied exactly as-is.
         """
         stripped      = []
-        kept          = []
         files_written = 0
-
-        # Files that must always be stored uncompressed in a valid APK
-        MUST_STORE_UNCOMPRESSED = {
-            "classes.dex", "resources.arsc",
-        }
+        MUST_STORE = {'classes.dex', 'resources.arsc'}
 
         try:
-            with zipfile.ZipFile(apk_path, 'r') as src:
-                # Open output as ZIP_STORED — we control compression per entry
-                with zipfile.ZipFile(out_path, 'w',
-                                     compression=zipfile.ZIP_STORED,
-                                     allowZip64=True) as dst:
+            with open(apk_path, 'rb') as f:
+                src_data = f.read()
 
-                    for item in src.infolist():
+            entries = self._parse_cd(src_data)
 
-                        # ── Skip signature artifacts ──────────────────────────
-                        is_sig = any(
-                            pat.match(item.filename)
-                            for pat in self.SIGNATURE_PATTERNS
-                        )
-                        if is_sig:
-                            stripped.append(item.filename)
-                            logger.info(
-                                f"[SignatureStripper] Stripped: {item.filename}")
-                            continue
+            # Build new ZIP in memory
+            out = bytearray()
+            new_offsets = {}  # filename -> new local header offset
 
-                        fname = item.filename
+            for entry in entries:
+                fname = entry['filename']
 
-                        # ── Read raw compressed bytes safely ──────────────────
-                        # Use src._RawReader path: read the compressed bytes
-                        # directly from the ZIP file object without decompressing.
-                        # This is safe for ALL compression methods including
-                        # non-standard method 16892 (AndroidManifest.xml patch).
-                        try:
-                            # Primary: read via ZipFile buffer — raw bytes
-                            # zipfile.ZipFile stores compressed data in the
-                            # central directory — we extract via _fileobj
-                            raw_data = src.read(fname)
-                            use_compress_type = item.compress_type
+                # Skip signature artifacts
+                if self._is_sig_file(fname):
+                    stripped.append(fname)
+                    logger.info(f"[SignatureStripper] Stripped: {fname}")
+                    continue
 
-                        except Exception:
-                            # Fallback for unknown compression methods:
-                            # Read raw compressed bytes directly from file offset
-                            try:
-                                src_fileobj = src.fp
-                                # Seek to local file header data offset
-                                # Local header: 30 bytes + filename + extra
-                                src_fileobj.seek(item.header_offset)
-                                # Read local file header to find data start
-                                lf_header = src_fileobj.read(30)
-                                if len(lf_header) >= 30 and \
-                                   lf_header[:4] == b'PK\x03\x04':
-                                    fn_len    = struct.unpack_from('<H', lf_header, 26)[0]
-                                    extra_len = struct.unpack_from('<H', lf_header, 28)[0]
-                                    src_fileobj.seek(
-                                        item.header_offset + 30 + fn_len + extra_len
-                                    )
-                                    raw_data = src_fileobj.read(item.compress_size)
-                                    use_compress_type = item.compress_type
-                                else:
-                                    logger.warning(
-                                        f"[SignatureStripper] Could not read "
-                                        f"raw bytes for {fname} — skipping"
-                                    )
-                                    continue
-                            except Exception as raw_err:
-                                logger.warning(
-                                    f"[SignatureStripper] Raw read failed "
-                                    f"for {fname}: {raw_err} — skipping"
-                                )
-                                continue
+                # Read raw compressed bytes — zero decompression
+                raw = self._read_raw_data(src_data, entry)
 
-                        # ── Build output ZipInfo — preserve all metadata ───────
-                        out_info              = zipfile.ZipInfo(fname)
-                        out_info.date_time    = item.date_time
-                        out_info.comment      = item.comment
-                        out_info.extra        = item.extra
-                        out_info.create_system  = item.create_system
-                        out_info.create_version = item.create_version
-                        out_info.extract_version= item.extract_version
-                        out_info.internal_attr  = item.internal_attr
-                        out_info.external_attr  = item.external_attr
-                        out_info.compress_size  = item.compress_size
-                        out_info.file_size      = item.file_size
-                        out_info.CRC            = item.CRC
-                        # flag_bits deliberately cleared — no encryption flag
-                        out_info.flag_bits      = item.flag_bits & ~0x1
+                # Record new offset before writing
+                new_offsets[fname] = len(out)
 
-                        # ── Force ZIP_STORED for critical APK entries ──────────
-                        if (fname in MUST_STORE_UNCOMPRESSED or
-                                re.match(r"^classes\d+\.dex$", fname)):
-                            out_info.compress_type = zipfile.ZIP_STORED
-                        else:
-                            # Preserve original compress_type including 16892
-                            out_info.compress_type = use_compress_type
+                # Determine compression method for output
+                if fname in MUST_STORE or re.match(r'^classes\d+\.dex$', fname):
+                    compress_method = 0   # ZIP_STORED
+                else:
+                    compress_method = entry['compress_method']  # preserve 16892 etc
 
-                        # ── Write raw bytes directly ───────────────────────────
-                        # writestr with a ZipInfo that has compress_type set
-                        # writes the data as-is when compress_type matches
-                        dst.writestr(out_info, raw_data)
-                        kept.append(fname)
-                        files_written += 1
+                # Clear encryption flag
+                flags = entry['flags'] & ~0x1
+
+                fn_bytes    = entry['fname_bytes']
+                extra_bytes = entry['extra_bytes']
+
+                # Write local file header
+                lhdr = struct.pack('<4sHHHHHIIIHH',
+                    b'PK\x03\x04',
+                    entry['version_needed'],
+                    flags,
+                    compress_method,
+                    entry['mod_time'],
+                    entry['mod_date'],
+                    entry['crc32'],
+                    entry['compress_size'],
+                    entry['uncompress_size'],
+                    len(fn_bytes),
+                    len(extra_bytes),
+                )
+                out += lhdr + fn_bytes + extra_bytes + raw
+                files_written += 1
+
+            # Write central directory
+            cd_offset = len(out)
+            cd = bytearray()
+            for entry in entries:
+                fname = entry['filename']
+                if self._is_sig_file(fname):
+                    continue
+                if fname not in new_offsets:
+                    continue
+
+                if fname in MUST_STORE or re.match(r'^classes\d+\.dex$', fname):
+                    compress_method = 0
+                else:
+                    compress_method = entry['compress_method']
+
+                flags       = entry['flags'] & ~0x1
+                fn_bytes    = entry['fname_bytes']
+                extra_bytes = entry['extra_bytes']
+                cmt_bytes   = entry['comment_bytes']
+
+                cde = struct.pack('<4sHHHHHHIIIHHHHHII',
+                    b'PK\x01\x02',
+                    entry['version_made'],
+                    entry['version_needed'],
+                    flags,
+                    compress_method,
+                    entry['mod_time'],
+                    entry['mod_date'],
+                    entry['crc32'],
+                    entry['compress_size'],
+                    entry['uncompress_size'],
+                    len(fn_bytes),
+                    len(extra_bytes),
+                    len(cmt_bytes),
+                    entry['disk_start'],
+                    entry['int_attr'],
+                    entry['ext_attr'],
+                    new_offsets[fname],
+                )
+                cd += cde + fn_bytes + extra_bytes + cmt_bytes
+
+            # Write End of Central Directory
+            kept_count = files_written
+            eocd = struct.pack('<4sHHHHIIH',
+                b'PK\x05\x06',
+                0, 0,
+                kept_count,
+                kept_count,
+                len(cd),
+                cd_offset,
+                0,
+            )
+            out += cd + eocd
+
+            # Write output file
+            with open(out_path, 'wb') as f:
+                f.write(out)
+
+            logger.info(
+                f"[SignatureStripper] Strip complete — "
+                f"{len(stripped)} removed — {files_written} kept"
+            )
 
         except Exception as e:
             raise RuntimeError(f"Signature strip failed: {e}")
